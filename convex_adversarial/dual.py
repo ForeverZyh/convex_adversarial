@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.autograd import Variable
 
 import numpy as np
@@ -41,8 +42,43 @@ def batch(A, n):
 def unbatch(A): 
     return A.view(-1, *A.size()[2:])
 
+def forward_linear(_coef_lb, _coef_ub, _bias_lb, _bias_ub, W, b):
+    coef_lb = torch.matmul(torch.clamp(W, min=0), _coef_lb) + torch.matmul(torch.clamp(W, max=0), _coef_ub)
+    coef_ub = torch.matmul(torch.clamp(W, min=0), _coef_ub) + torch.matmul(torch.clamp(W, max=0), _coef_lb)
+    bias_lb = torch.matmul(_bias_lb, torch.clamp(W, min=0).t()) + torch.matmul(_bias_ub, torch.clamp(W, max=0).t()) + b
+    bias_ub = torch.matmul(_bias_ub, torch.clamp(W, min=0).t()) + torch.matmul(_bias_lb, torch.clamp(W, max=0).t()) + b
+
+    return coef_lb, coef_ub, bias_lb, bias_ub
+
+def forward_activation(_coef_lb, _coef_ub, _bias_lb, _bias_ub, lb, ub):
+    # lb, ub [batch, last_dim]
+    # _coef_lb, _coef_ub [batch, last_dim, input]
+    # _bias_lb, _bias_ub [batch, last_dim]
+    lb_coef_pre = torch.where(lb >= 0, torch.ones_like(lb),
+                              torch.where(ub <= 0,
+                                          torch.zeros_like(lb),
+                                          torch.where(-lb < ub,
+                                                      torch.ones_like(lb),
+                                                      torch.zeros_like(lb))))
+    ub_coef_pre = torch.where(lb >= 0, torch.ones_like(lb),
+                              torch.where(ub <= 0,
+                                          torch.zeros_like(lb),
+                                          ub / (ub - lb)))
+    
+    # lb_coef_pre, ub_coef_pre [batch, last_dim]
+    lb_cst_pre = torch.zeros_like(lb)
+    ub_cst_pre = torch.where((lb >= 0) | (ub <= 0), torch.zeros_like(lb),
+                             -lb * ub / (ub - lb))
+    # lb_cst_pre, ub_cst_pre [batch, last_dim]
+    
+    coef_lb = _coef_lb * torch.clamp(lb_coef_pre, min=0).unsqueeze(-1) + _coef_ub * torch.clamp(lb_coef_pre, max=0).unsqueeze(-1)
+    coef_ub = _coef_ub * torch.clamp(ub_coef_pre, min=0).unsqueeze(-1) + _coef_lb * torch.clamp(ub_coef_pre, max=0).unsqueeze(-1)
+    bias_lb = _bias_lb * torch.clamp(lb_coef_pre, min=0) + _bias_ub * torch.clamp(lb_coef_pre, max=0) + lb_cst_pre
+    bias_ub = _bias_ub * torch.clamp(ub_coef_pre, min=0) + _bias_lb * torch.clamp(ub_coef_pre, max=0) + ub_cst_pre
+    return coef_lb, coef_ub, bias_lb, bias_ub
+
 class DualNetBounds: 
-    def __init__(self, net, X, epsilon, alpha_grad=False, scatter_grad=False):
+    def __init__(self, net, X, epsilon, alpha_grad=False, scatter_grad=False, bound_type="paper"):
         n = X.size(0)
 
         self.layers = [l for l in net if isinstance(l, (nn.Linear, nn.Conv2d))]
@@ -69,6 +105,13 @@ class DualNetBounds:
         
         self.zl = [nu_hat_x + gamma[0] - epsilon*l1]
         self.zu = [nu_hat_x + gamma[0] + epsilon*l1]
+        if bound_type == "LBP":
+            coef_lb = torch.eye(self.affine[0].in_features).unsqueeze(0).repeat(n, 1, 1).cuda()
+            coef_ub = coef_lb.clone()
+            bias_lb = - torch.ones((n, self.affine[0].in_features)).cuda() * epsilon
+            bias_ub = - bias_lb
+            coef_lb, coef_ub, bias_lb, bias_ub = forward_linear(coef_lb, coef_ub, bias_lb, bias_ub, self.affine[0].l.weight, self.affine[0].l.bias)
+            
 
         self.I = []
         self.I_empty = []
@@ -84,6 +127,9 @@ class DualNetBounds:
         self.alpha_grad = alpha_grad
 
         for i in range(0,self.k-2):
+            if bound_type == "LBP": # ReLU
+                # compute coef_lb, coef_ub, bias_lb, bias_ub for i+1-th layer
+                coef_lb, coef_ub, bias_lb, bias_ub = forward_activation(coef_lb, coef_ub, bias_lb, bias_ub, self.zl[-1], self.zu[-1])
             # compute sets and activation
             self.I_neg.append((self.zu[-1] <= 0).detach())
             self.I_pos.append((self.zl[-1] > 0).detach())
@@ -132,12 +178,25 @@ class DualNetBounds:
             l1 = (nu_hat_1).abs().sum(1)
             
             # compute bounds
-            self.zl.append(nu_hat_x + sum(gamma) - epsilon*l1 + 
-                           sum([(self.zl[j][self.I[j]] * (-nu[j].t()).clamp(min=0)).mm(I_collapse[j]).t()
-                                for j in range(i+1) if not self.I_empty[j]]))
-            self.zu.append(nu_hat_x + sum(gamma) + epsilon*l1 - 
-                           sum([(self.zl[j][self.I[j]] * nu[j].t().clamp(min=0)).mm(I_collapse[j]).t()
-                                for j in range(i+1) if not self.I_empty[j]]))
+            if bound_type == "paper":
+                self.zl.append(nu_hat_x + sum(gamma) - epsilon*l1 + 
+                               sum([(self.zl[j][self.I[j]] * (-nu[j].t()).clamp(min=0)).mm(I_collapse[j]).t()
+                                    for j in range(i+1) if not self.I_empty[j]]))
+                self.zu.append(nu_hat_x + sum(gamma) + epsilon*l1 - 
+                               sum([(self.zl[j][self.I[j]] * nu[j].t().clamp(min=0)).mm(I_collapse[j]).t()
+                                    for j in range(i+1) if not self.I_empty[j]]))
+            elif bound_type == "IBP":
+                l = self.affine[i+1](F.relu(self.zl[-1]))
+                u = self.affine[i+1](F.relu(self.zu[-1]))
+                self.zl.append(torch.min(l, u) + self.biases[i+1])
+                self.zu.append(torch.max(l, u) + self.biases[i+1])
+            elif bound_type == "LBP":
+                coef_lb, coef_ub, bias_lb, bias_ub = forward_linear(coef_lb, coef_ub, bias_lb, bias_ub, self.affine[i+1].l.weight, self.affine[i+1].l.bias)
+                lb = torch.sum(coef_lb * self.X.view(n,1,-1), dim=-1) + bias_lb 
+                ub = torch.sum(coef_ub * self.X.view(n,1,-1), dim=-1) + bias_ub 
+                self.zl.append(lb)
+                self.zu.append(ub)
+                
         
         self.s = [torch.zeros_like(u) for l,u in zip(self.zl, self.zu)]
 
@@ -156,16 +215,18 @@ class DualNetBounds:
             if i > 0:
                 # avoid in place operation
                 out = nu[i].clone()
-                out[self.I_neg[i-1].unsqueeze(1)] = 0
+                i_neg_index = self.I_neg[i-1].unsqueeze(1).repeat(1, 10, 1)
+                i_index = self.I[i-1].unsqueeze(1).repeat(1, 10, 1)
+                out[i_neg_index] = 0
                 if not self.I_empty[i-1]:
                     if self.alpha_grad: 
-                        out[self.I[i-1].unsqueeze(1)] = (self.s[i-1].unsqueeze(1).expand(*nu[i].size())[self.I[i-1].unsqueeze(1)] * 
-                                                               nu[i][self.I[i-1].unsqueeze(1)])
+                        out[i_index] = (self.s[i-1].unsqueeze(1).expand(*nu[i].size())[i_index] * 
+                                                               nu[i][i_index])
                     else:
-                        out[self.I[i-1].unsqueeze(1)] = ((self.s[i-1].unsqueeze(1).expand(*nu[i].size())[self.I[i-1].unsqueeze(1)] * 
-                                                                                   torch.clamp(nu[i], min=0)[self.I[i-1].unsqueeze(1)])
-                                                         + (self.s[i-1].detach().unsqueeze(1).expand(*nu[i].size())[self.I[i-1].unsqueeze(1)] * 
-                                                                                   torch.clamp(nu[i], max=0)[self.I[i-1].unsqueeze(1)]))
+                        out[i_index] = ((self.s[i-1].unsqueeze(1).expand(*nu[i].size())[i_index] * 
+                                                                                   torch.clamp(nu[i], min=0)[i_index])
+                                                         + (self.s[i-1].detach().unsqueeze(1).expand(*nu[i].size())[i_index] * 
+                                                                                   torch.clamp(nu[i], max=0)[i_index]))
                 nu[i] = out
 
         f = (-sum(nu[i+1].matmul(self.biases[i].view(-1)) for i in range(self.k-1))
@@ -173,19 +234,19 @@ class DualNetBounds:
              -self.epsilon*nu[0].abs().sum(2)
              + sum((nu[i].clamp(min=0)*self.zl[i-1].unsqueeze(1)).matmul(self.I[i-1].type_as(self.X).unsqueeze(2)).squeeze(2) 
                     for i in range(1, self.k-1) if not self.I_empty[i-1]))
-
+           
         return f
 
 def robust_loss(net, epsilon, X, y, 
-                size_average=True, alpha_grad=False, scatter_grad=False):
+                size_average=True, alpha_grad=False, scatter_grad=False, bound_type="paper"):
     num_classes = net[-1].out_features
-    dual = DualNetBounds(net, X, epsilon, alpha_grad, scatter_grad)
+    dual = DualNetBounds(net, X, epsilon, alpha_grad, scatter_grad, bound_type)
     c = Variable(torch.eye(num_classes).type_as(X.data)[y.data].unsqueeze(1) - torch.eye(num_classes).type_as(X.data).unsqueeze(0))
     if X.is_cuda:
         c = c.cuda()
     f = -dual.g(c)
     err = (f.data.max(1)[1] != y.data)
     if size_average: 
-        err = err.sum()/X.size(0)
+        err = err.sum().item()/X.size(0)
     ce_loss = nn.CrossEntropyLoss(size_average=size_average)(f, y)
     return ce_loss, err

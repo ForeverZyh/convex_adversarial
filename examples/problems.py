@@ -29,12 +29,10 @@ def fashion_mnist_loaders(batch_size):
 
 def mnist_model(): 
     model = nn.Sequential(
-        nn.Conv2d(1, 16, 4, stride=2, padding=1),
-        nn.ReLU(),
-        nn.Conv2d(16, 32, 4, stride=2, padding=1),
-        nn.ReLU(),
         Flatten(),
-        nn.Linear(32*7*7,100),
+        nn.Linear(28*28, 32*32),
+        nn.ReLU(),
+        nn.Linear(32*32, 100),
         nn.ReLU(),
         nn.Linear(100, 10)
     )

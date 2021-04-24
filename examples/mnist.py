@@ -29,9 +29,10 @@ if __name__ == "__main__":
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--alpha_grad', action='store_true')
     parser.add_argument('--scatter_grad', action='store_true')
+    parser.add_argument('--bound_type', type=str, default="paper")
     parser.add_argument('--l1_proj', type=int, default=None)
     args = parser.parse_args()
-    args.prefix = args.prefix or 'mnist_conv_{:.4f}_{:.4f}_0'.format(args.epsilon, args.lr).replace(".","_")
+    args.prefix = args.prefix or 'mnist_conv_{:.4f}_{:.4f}_0'.format(args.epsilon, args.lr).replace(".","_") + args.bound_type
     setproctitle.setproctitle(args.prefix)
 
     train_log = open(args.prefix + "_train.log", "w")
@@ -56,7 +57,7 @@ if __name__ == "__main__":
                 epsilon = args.epsilon
             train_robust(train_loader, model, opt, epsilon, t, train_log, 
                 args.verbose, 
-                args.alpha_grad, args.scatter_grad, l1_proj=args.l1_proj)
-            evaluate_robust(test_loader, model, args.epsilon, t, test_log, args.verbose)
+                args.alpha_grad, args.scatter_grad, l1_proj=args.l1_proj, bound_type=args.bound_type)
+            evaluate_robust(test_loader, model, args.epsilon, t, test_log, args.verbose, args.bound_type)
 
         torch.save(model.state_dict(), args.prefix + "_model.pth")
