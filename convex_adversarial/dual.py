@@ -108,8 +108,8 @@ class DualNetBounds:
         if bound_type == "LBP":
             coef_lb = torch.eye(self.affine[0].in_features).unsqueeze(0).repeat(n, 1, 1).cuda()
             coef_ub = coef_lb.clone()
-            bias_lb = - torch.ones((n, self.affine[0].in_features)).cuda() * epsilon
-            bias_ub = - bias_lb
+            bias_lb = torch.zeros((n, self.affine[0].in_features)).cuda()
+            bias_ub = bias_lb.clone()
             coef_lb, coef_ub, bias_lb, bias_ub = forward_linear(coef_lb, coef_ub, bias_lb, bias_ub, self.affine[0].l.weight, self.affine[0].l.bias)
             
 
@@ -192,8 +192,10 @@ class DualNetBounds:
                 self.zu.append(torch.max(l, u) + self.biases[i+1])
             elif bound_type == "LBP":
                 coef_lb, coef_ub, bias_lb, bias_ub = forward_linear(coef_lb, coef_ub, bias_lb, bias_ub, self.affine[i+1].l.weight, self.affine[i+1].l.bias)
-                lb = torch.sum(coef_lb * self.X.view(n,1,-1), dim=-1) + bias_lb 
-                ub = torch.sum(coef_ub * self.X.view(n,1,-1), dim=-1) + bias_ub 
+                input_lb = (self.X.view(n, -1) - epsilon).view(n, 1, -1)
+                input_ub = (self.X.view(n, -1) + epsilon).view(n, 1, -1)
+                lb = torch.sum(torch.clamp(coef_lb, min=0) * input_lb + torch.clamp(coef_lb, max=0) * input_ub, dim=-1) + bias_lb 
+                ub = torch.sum(torch.clamp(coef_ub, min=0) * input_ub + torch.clamp(coef_ub, max=0) * input_lb, dim=-1) + bias_ub 
                 self.zl.append(lb)
                 self.zu.append(ub)
                 
@@ -215,8 +217,8 @@ class DualNetBounds:
             if i > 0:
                 # avoid in place operation
                 out = nu[i].clone()
-                i_neg_index = self.I_neg[i-1].unsqueeze(1).repeat(1, 10, 1)
-                i_index = self.I[i-1].unsqueeze(1).repeat(1, 10, 1)
+                i_neg_index = self.I_neg[i-1].unsqueeze(1).repeat(1, out.size(1), 1)
+                i_index = self.I[i-1].unsqueeze(1).repeat(1, out.size(1), 1)
                 out[i_neg_index] = 0
                 if not self.I_empty[i-1]:
                     if self.alpha_grad: 
